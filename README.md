@@ -1,7 +1,19 @@
 # 🛫 Monitor de Milhas — Livelo + Passagens UDI→RIO
 
-Roda automaticamente às **08h10 (BRT)** via GitHub Actions.  
+Roda automaticamente às **08h00 (BRT)** via GitHub Actions.
 Envia relatório diário no **WhatsApp** via Evolution API.
+
+---
+
+## 🛠️ Stack
+
+| Componente | Detalhe |
+|---|---|
+| **CI/CD** | GitHub Actions |
+| **Busca de voos** | SerpApi (Google Flights) |
+| **Busca de bônus Livelo** | DuckDuckGo (scraping) |
+| **Servidor WhatsApp** | Oracle Cloud Free Tier VM AMD E2.Micro — Ubuntu 22.04 |
+| **Gateway WhatsApp** | Evolution API v1.8.2 (Docker) |
 
 ---
 
@@ -24,32 +36,26 @@ git clone https://github.com/SEU_USUARIO/monitor-milhas
 cd monitor-milhas
 ```
 
-### 2. Amadeus API (passagens aéreas)
+### 2. SerpApi (passagens aéreas)
 
-1. Acesse [developers.amadeus.com](https://developers.amadeus.com) e crie conta gratuita
-2. Crie um novo app → copie `Client ID` e `Client Secret`
-3. A API de test é gratuita com dados reais de voos
-
-> ⚠️ Quando quiser ir para produção, troque a URL base de  
-> `test.api.amadeus.com` → `api.amadeus.com` no `monitor.py`
+1. Acesse [serpapi.com](https://serpapi.com) e crie conta gratuita
+2. Copie sua `API Key` no painel
+3. O plano gratuito oferece 100 buscas/mês
 
 ### 3. Evolution API (WhatsApp)
 
-Você precisa de uma instância rodando. Opções:
+Você precisa de uma instância rodando. Recomendado: Oracle Cloud Free Tier VM AMD E2.Micro com Ubuntu 22.04.
 
-**A) Self-hosted (recomendado):**
+**Self-hosted via Docker:**
 ```bash
-# Via Docker
 docker run -d \
   --name evolution \
   -p 8080:8080 \
   -e AUTHENTICATION_API_KEY=sua_chave_aqui \
-  atendai/evolution-api:latest
+  atendai/evolution-api:v1.8.2
 ```
 
-Depois acesse `http://localhost:8080` e conecte seu WhatsApp escaneando o QR Code.
-
-**B) VPS barata:** DigitalOcean ($6/mês), Oracle Cloud (grátis), ou qualquer VPS com Docker.
+Depois acesse `http://seu-ip:8080` e conecte seu WhatsApp escaneando o QR Code.
 
 ### 4. Configurar Secrets no GitHub
 
@@ -57,8 +63,7 @@ No seu repositório → **Settings → Secrets and variables → Actions → New
 
 | Secret | Valor |
 |---|---|
-| `AMADEUS_CLIENT_ID` | ID do app no Amadeus |
-| `AMADEUS_CLIENT_SECRET` | Secret do app no Amadeus |
+| `SERPAPI_KEY` | Sua API Key do SerpApi |
 | `EVOLUTION_API_URL` | URL da sua instância (ex: `https://sua-evolution.com`) |
 | `EVOLUTION_API_KEY` | API Key configurada no Evolution |
 | `EVOLUTION_INSTANCE` | Nome da instância no Evolution |
@@ -66,7 +71,7 @@ No seu repositório → **Settings → Secrets and variables → Actions → New
 
 ### 5. Ativar GitHub Actions
 
-O arquivo `.github/workflows/monitor.yml` já está configurado.  
+O arquivo `.github/workflows/monitor.yml` já está configurado.
 Basta garantir que Actions esteja habilitado no repo (Settings → Actions → Allow all).
 
 ### 6. Testar manualmente
@@ -80,7 +85,7 @@ Você receberá a mensagem no WhatsApp em segundos.
 ## 📱 Exemplo de mensagem recebida
 
 ```
-🤖 Monitor de Milhas — 20/03/2026 08:10
+🤖 Monitor de Milhas — 20/03/2026 08:00
 
 ✈️ PASSAGENS UDI → RIO (2 adultos)
 🟡 07/08 → 10/08 | R$ 2.004 | LA → SDU
@@ -122,8 +127,8 @@ DESTINO_LIST = ["SDU", "GIG"]
 | Item | Custo |
 |---|---|
 | GitHub Actions | **Grátis** (usa ~1 min/dia dos 2000 grátis/mês) |
-| Amadeus API | **Grátis** (até 2000 req/mês) |
+| SerpApi | **Grátis** (até 100 buscas/mês) |
 | Evolution API | **Grátis** (self-hosted com Docker) |
-| VPS para Evolution | Oracle Cloud Free Tier = **R$ 0** |
+| Oracle Cloud Free Tier VM | **R$ 0** |
 
 **Custo total: R$ 0/mês** 🎉
