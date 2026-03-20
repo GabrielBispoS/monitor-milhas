@@ -1,11 +1,18 @@
 """
 Monitor de Milhas e Passagens Aéreas
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Passagens: UDI → RIO, 2 adultos, agosto/2026
+Passagens: UDI → RIO (GIG/SDU), 2 adultos, agosto/2026
 API voos:  SerpApi / Google Flights (2 req/dia → ~62/mês, free tier = 100)
 Livelo:    DuckDuckGo (gratuito, sem API key)
 Envio:     WhatsApp via Evolution API
 Execução:  GitHub Actions, 1x ao dia às 08h00 BRT
+
+CORREÇÕES APLICADAS (v2):
+  - arrival_id alterado de "RIO" (inválido) para kgmid do Rio de Janeiro
+  - deep_search=true adicionado (resultados mais precisos para rotas regionais)
+  - Parsing de price robusto (int/float/None)
+  - Fallback para price_insights.lowest_price
+  - Formatação de mensagem WhatsApp melhorada
 """
 
 import os
@@ -21,17 +28,20 @@ log = logging.getLogger(__name__)
 # SECRETS (configurados nos GitHub Secrets do repositório)
 # ──────────────────────────────────────────────────────────────
 SERPAPI_KEY        = os.environ["SERPAPI_KEY"]
-EVOLUTION_API_URL  = os.environ["EVOLUTION_API_URL"]    # ex: https://minha-evolution.com
+EVOLUTION_API_URL  = os.environ["EVOLUTION_API_URL"]    # ex: http://137.131.236.152:8080
 EVOLUTION_API_KEY  = os.environ["EVOLUTION_API_KEY"]
-EVOLUTION_INSTANCE = os.environ["EVOLUTION_INSTANCE"]   # nome da instância
+EVOLUTION_INSTANCE = os.environ["EVOLUTION_INSTANCE"]   # monitor-milhas
 WHATSAPP_NUMBER    = os.environ["WHATSAPP_NUMBER"]       # ex: 5534999999999
 
 # ──────────────────────────────────────────────────────────────
 # PARÂMETROS DE VIAGEM
 # ──────────────────────────────────────────────────────────────
-ORIGEM     = "UDI"
-ADULTOS    = 2
-PRECO_ALVO = 1500.00  # R$ — abaixo disso dispara alerta de compra imediata
+ORIGEM      = "UDI"
+# CORREÇÃO: "RIO" não é código IATA válido na SerpApi.
+# Usar kgmid do Rio de Janeiro para cobrir GIG e SDU automaticamente.
+DESTINO     = "/m/0f2r2"   # kgmid do Rio de Janeiro (cobre GIG e SDU)
+ADULTOS     = 2
+PRECO_ALVO  = 1500.00      # R$ — abaixo disso dispara alerta de compra imediata
 
 # 4 finais de semana de agosto/2026 (sexta → segunda)
 DATAS_VIAGEM = [
@@ -67,51 +77,105 @@ LIMIAR_BONUS_VAREJO = 8    # pontos/R$ mínimo para alertar
 # ══════════════════════════════════════════════════════════════
 
 def buscar_voo(datas: dict) -> dict | None:
-    """Busca o voo mais barato UDI→RIO para um par de datas. Usa 1 req SerpApi."""
+    """
+    Busca o voo mais barato UDI→RIO para um par de datas. Usa 1 req SerpApi.
+
+    CORREÇÕES v2:
+    - arrival_id usa kgmid /m/0f2r2 (Rio de Janeiro) em vez de "RIO" (inválido)
+    - deep_search=true garante resultados precisos para rotas regionais brasileiras
+    - price tratado como int ou float, nunca falha em preco == 0
+    - Fallback para price_insights.lowest_price quando best_flights/other_flights vazios
+    """
     params = {
         "engine":        "google_flights",
         "departure_id":  ORIGEM,
-        "arrival_id":    "RIO",        # abrange GIG e SDU automaticamente
+        "arrival_id":    DESTINO,      # kgmid do Rio (cobre GIG e SDU)
         "outbound_date": datas["ida"],
         "return_date":   datas["volta"],
         "adults":        ADULTOS,
         "currency":      "BRL",
         "hl":            "pt",
+        "gl":            "br",         # geolocalização Brasil → resultados em BRL reais
         "type":          "1",          # 1 = ida e volta
+        "deep_search":   "true",       # CORREÇÃO: resultados precisos para rotas regionais
         "api_key":       SERPAPI_KEY,
     }
     try:
-        r = requests.get("https://serpapi.com/search", params=params, timeout=25)
+        r = requests.get("https://serpapi.com/search", params=params, timeout=40)
         r.raise_for_status()
         data = r.json()
 
+        # Log para debug (aparece nos logs do GitHub Actions)
+        chaves_raiz = list(data.keys())
+        log.info(f"  [SerpApi] chaves na resposta: {chaves_raiz}")
+
+        if "error" in data:
+            log.warning(f"  [SerpApi] erro da API: {data['error']}")
+            return None
+
         melhor = None
+
         for grupo in ["best_flights", "other_flights"]:
             for voo in data.get(grupo, []):
-                preco = voo.get("price")
-                if preco and (melhor is None or preco < melhor["preco"]):
+                # CORREÇÃO: price pode ser int, float ou ausente — nunca usar "if preco"
+                preco_raw = voo.get("price")
+                if preco_raw is None:
+                    continue
+                preco = float(preco_raw)
+
+                if melhor is None or preco < melhor["preco"]:
                     legs        = voo.get("flights", [{}])
-                    destino     = legs[-1].get("arrival_airport", {}).get("id", "RIO")
-                    cia         = legs[0].get("airline", "N/A")
+                    primeiro    = legs[0] if legs else {}
+                    ultimo      = legs[-1] if legs else {}
+
+                    destino_id  = (
+                        ultimo.get("arrival_airport", {}).get("id")
+                        or ultimo.get("arrival_airport", {}).get("name", "RIO")
+                    )
+                    cia         = primeiro.get("airline", "N/A")
                     escalas     = len(voo.get("layovers", []))
-                    dur_min     = voo.get("total_duration", 0)
+                    dur_min     = voo.get("total_duration", 0) or 0
                     duracao     = f"{dur_min // 60}h{dur_min % 60:02d}" if dur_min else "N/A"
                     label_volta = datas["volta"][8:10] + "/" + datas["volta"][5:7]
-                    melhor      = {
+
+                    melhor = {
                         "label":       datas["label"],
                         "label_volta": label_volta,
                         "ida":         datas["ida"],
                         "volta":       datas["volta"],
-                        "preco":       float(preco),
+                        "preco":       preco,
                         "cia":         cia,
-                        "destino":     destino,
+                        "destino":     destino_id,
                         "escalas":     escalas,
                         "duracao":     duracao,
                     }
+
+        # CORREÇÃO: fallback via price_insights se nenhum voo parseado
+        if melhor is None:
+            insights = data.get("price_insights", {})
+            preco_insights = insights.get("lowest_price")
+            if preco_insights is not None:
+                label_volta = datas["volta"][8:10] + "/" + datas["volta"][5:7]
+                melhor = {
+                    "label":       datas["label"],
+                    "label_volta": label_volta,
+                    "ida":         datas["ida"],
+                    "volta":       datas["volta"],
+                    "preco":       float(preco_insights),
+                    "cia":         "Diversas",
+                    "destino":     "RIO",
+                    "escalas":     0,
+                    "duracao":     "N/A",
+                }
+                log.info(f"  [SerpApi] usando price_insights.lowest_price: R$ {preco_insights}")
+
         return melhor
 
+    except requests.exceptions.Timeout:
+        log.warning(f"  [SerpApi] timeout na busca [{datas['label']}] — deep_search pode demorar até 40s")
+        return None
     except Exception as e:
-        log.warning(f"Erro SerpApi [{datas['label']}]: {e}")
+        log.warning(f"  [SerpApi] erro [{datas['label']}]: {e}")
         return None
 
 
@@ -179,7 +243,7 @@ def buscar_promocoes_livelo() -> dict:
     # Detectar varejo turbinado
     for parceiro in PARCEIROS_VAREJO:
         if parceiro in texto_total:
-            match = re.search(r"(\d+)\s*(?:pontos?|pts?)\s*/?\s*r\$", texto_total)
+            match = re.search(r"(\d+)\s*(?:pontos?|pts?)\s*/?\\s*r\$", texto_total)
             pts   = int(match.group(1)) if match else 0
             if pts >= LIMIAR_BONUS_VAREJO:
                 if not any(v["loja"] == parceiro.title() for v in resultado["varejo"]):
@@ -194,57 +258,92 @@ def buscar_promocoes_livelo() -> dict:
 # ══════════════════════════════════════════════════════════════
 
 def formatar_mensagem(passagens: list[dict], livelo: dict) -> str:
-    hoje   = datetime.now().strftime("%d/%m/%Y %H:%M")
-    linhas = [f"🤖 *Monitor de Milhas — {hoje}*\n"]
+    """
+    Formata a mensagem para o WhatsApp.
+    Usa negrito (*texto*) e emojis compatíveis com WhatsApp.
+    """
+    hoje = datetime.now().strftime("%d/%m %H:%M")
+    linhas = []
 
-    # ── Passagens ──────────────────────────────────────────
-    linhas.append(f"✈️ *PASSAGENS UDI → RIO* (2 adultos)")
+    # ── Cabeçalho ──────────────────────────────────────────────
+    linhas.append(f"🛫 *Monitor de Milhas* — {hoje}")
+    linhas.append("─" * 30)
+
+    # ── Passagens ──────────────────────────────────────────────
+    linhas.append("")
+    linhas.append("✈️ *PASSAGENS UDI → RIO*")
+    linhas.append(f"_2 adultos · agosto/2026_")
 
     if not passagens:
-        linhas.append("⚠️ Nenhuma passagem encontrada hoje.")
+        linhas.append("")
+        linhas.append("⚠️ Nenhuma passagem encontrada.")
+        linhas.append("_Verifique os logs do GitHub Actions._")
     else:
         melhor = min(passagens, key=lambda p: p["preco"])
+        linhas.append("")
+
         for p in sorted(passagens, key=lambda p: p["ida"]):
-            emoji = "🟢" if p["preco"] <= PRECO_ALVO else "🟡"
-            esc   = f"{p['escalas']} escala" if p["escalas"] == 1 else f"{p['escalas']} escalas"
+            abaixo_meta = p["preco"] <= PRECO_ALVO
+            emoji_preco = "🟢" if abaixo_meta else "🔴"
+
+            if p["escalas"] == 0:
+                escala_txt = "direto"
+            elif p["escalas"] == 1:
+                escala_txt = "1 escala"
+            else:
+                escala_txt = f"{p['escalas']} escalas"
+
             linhas.append(
-                f"{emoji} {p['label']} → {p['label_volta']} | "
-                f"*R$ {p['preco']:.0f}* | {p['cia']} ({p['destino']}) | {esc} | {p['duracao']}"
+                f"{emoji_preco} *{p['label']} → {p['label_volta']}*\n"
+                f"   💰 *R$ {p['preco']:.0f}* (2 pax)\n"
+                f"   🏢 {p['cia']}  |  🛬 {p['destino']}  |  ⏱ {p['duracao']}  |  {escala_txt}"
             )
 
         linhas.append("")
         if melhor["preco"] <= PRECO_ALVO:
             linhas.append(
-                f"🚨 *COMPRA RECOMENDADA!* {melhor['label']} por *R$ {melhor['preco']:.0f}* (2 pessoas)"
+                f"🚨 *COMPRAR AGORA!*\n"
+                f"   {melhor['label']} por *R$ {melhor['preco']:.0f}* — abaixo da meta!"
             )
         else:
             diff = melhor["preco"] - PRECO_ALVO
             linhas.append(
-                f"⏳ Melhor preço: *R$ {melhor['preco']:.0f}* ({melhor['label']}) "
-                f"— faltam R$ {diff:.0f} para a meta de R$ {PRECO_ALVO:.0f}"
+                f"⏳ *Melhor preço:* R$ {melhor['preco']:.0f} ({melhor['label']})\n"
+                f"   Faltam *R$ {diff:.0f}* para a meta de R$ {PRECO_ALVO:.0f}"
             )
 
     linhas.append("")
+    linhas.append("─" * 30)
 
-    # ── Livelo — Transferências aéreas ─────────────────────
-    linhas.append("🏦 *BÔNUS DE TRANSFERÊNCIA LIVELO*")
+    # ── Livelo — Bônus transferência ───────────────────────────
+    linhas.append("")
+    linhas.append("🏦 *BÔNUS LIVELO → AÉREAS*")
+
     if livelo["aereas"]:
+        linhas.append("")
         for a in livelo["aereas"]:
-            linhas.append(f"🔥 {a['programa']}: *+{a['bonus_pct']}% de bônus* — AGIR HOJE!")
+            linhas.append(f"🔥 *{a['programa']}:* +{a['bonus_pct']}% de bônus")
+        linhas.append("_⚡ Transferir hoje para aproveitar!_")
     else:
-        linhas.append("😴 Sem bônus relevantes. Aguardar.")
+        linhas.append("😴 Sem bônus relevantes hoje.")
 
     linhas.append("")
 
-    # ── Livelo — Varejo ────────────────────────────────────
-    linhas.append("🛍️ *PONTUAÇÃO TURBINADA — VAREJO*")
-    if livelo["varejo"]:
-        for v in livelo["varejo"]:
-            linhas.append(f"⭐ {v['loja']}: *{v['pontos_por_real']}pts/R$* — válido hoje")
-    else:
-        linhas.append(f"📊 Sem ofertas acima de {LIMIAR_BONUS_VAREJO}pts/R$ hoje.")
+    # ── Livelo — Varejo turbinado ──────────────────────────────
+    linhas.append("🛍️ *VAREJO TURBINADO LIVELO*")
 
-    linhas.append("\n_GitHub Actions · SerpApi · Evolution API_")
+    if livelo["varejo"]:
+        linhas.append("")
+        for v in livelo["varejo"]:
+            linhas.append(f"⭐ *{v['loja']}:* {v['pontos_por_real']} pts/R$")
+    else:
+        linhas.append(f"📊 Nada acima de {LIMIAR_BONUS_VAREJO} pts/R$ hoje.")
+
+    # ── Rodapé ─────────────────────────────────────────────────
+    linhas.append("")
+    linhas.append("─" * 30)
+    linhas.append("_GitHub Actions · SerpApi · Evolution API_")
+
     return "\n".join(linhas)
 
 
@@ -263,6 +362,8 @@ def enviar_whatsapp(mensagem: str) -> bool:
         return True
     except Exception as e:
         log.error(f"❌ Erro ao enviar WhatsApp: {e}")
+        if hasattr(e, "response") and e.response is not None:
+            log.error(f"   Resposta: {e.response.text[:300]}")
         return False
 
 
@@ -272,14 +373,14 @@ def enviar_whatsapp(mensagem: str) -> bool:
 
 def main():
     log.info("══════════════════════════════════")
-    log.info("  Monitor de Milhas — iniciando  ")
+    log.info("  Monitor de Milhas v2 — iniciando")
     log.info("══════════════════════════════════")
 
     passagens = buscar_passagens()
     livelo    = buscar_promocoes_livelo()
     mensagem  = formatar_mensagem(passagens, livelo)
 
-    log.info(f"\n{mensagem}\n")
+    log.info(f"\n{'='*40}\nMENSAGEM FINAL:\n{mensagem}\n{'='*40}\n")
     enviar_whatsapp(mensagem)
 
     log.info("══════════════════════════════════")
