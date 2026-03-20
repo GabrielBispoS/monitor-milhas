@@ -90,16 +90,23 @@ def buscar_voo(datas: dict) -> dict | None:
             for voo in data.get(grupo, []):
                 preco = voo.get("price")
                 if preco and (melhor is None or preco < melhor["preco"]):
-                    legs    = voo.get("flights", [{}])
-                    destino = legs[-1].get("arrival_airport", {}).get("id", "RIO")
-                    cia     = legs[0].get("airline", "N/A")
-                    melhor  = {
-                        "label":   datas["label"],
-                        "ida":     datas["ida"],
-                        "volta":   datas["volta"],
-                        "preco":   float(preco),
-                        "cia":     cia,
-                        "destino": destino,
+                    legs        = voo.get("flights", [{}])
+                    destino     = legs[-1].get("arrival_airport", {}).get("id", "RIO")
+                    cia         = legs[0].get("airline", "N/A")
+                    escalas     = len(voo.get("layovers", []))
+                    dur_min     = voo.get("total_duration", 0)
+                    duracao     = f"{dur_min // 60}h{dur_min % 60:02d}" if dur_min else "N/A"
+                    label_volta = datas["volta"][8:10] + "/" + datas["volta"][5:7]
+                    melhor      = {
+                        "label":       datas["label"],
+                        "label_volta": label_volta,
+                        "ida":         datas["ida"],
+                        "volta":       datas["volta"],
+                        "preco":       float(preco),
+                        "cia":         cia,
+                        "destino":     destino,
+                        "escalas":     escalas,
+                        "duracao":     duracao,
                     }
         return melhor
 
@@ -187,14 +194,11 @@ def buscar_promocoes_livelo() -> dict:
 # ══════════════════════════════════════════════════════════════
 
 def formatar_mensagem(passagens: list[dict], livelo: dict) -> str:
-    hoje       = datetime.now().strftime("%d/%m/%Y %H:%M")
-    dia_do_mes = datetime.now().day
-    par_nome   = "A (07/08 e 21/08)" if dia_do_mes % 2 == 0 else "B (14/08 e 28/08)"
-
+    hoje   = datetime.now().strftime("%d/%m/%Y %H:%M")
     linhas = [f"🤖 *Monitor de Milhas — {hoje}*\n"]
 
     # ── Passagens ──────────────────────────────────────────
-    linhas.append(f"✈️ *PASSAGENS UDI → RIO* _(par {par_nome})_")
+    linhas.append(f"✈️ *PASSAGENS UDI → RIO* (2 adultos)")
 
     if not passagens:
         linhas.append("⚠️ Nenhuma passagem encontrada hoje.")
@@ -202,22 +206,22 @@ def formatar_mensagem(passagens: list[dict], livelo: dict) -> str:
         melhor = min(passagens, key=lambda p: p["preco"])
         for p in sorted(passagens, key=lambda p: p["ida"]):
             emoji = "🟢" if p["preco"] <= PRECO_ALVO else "🟡"
+            esc   = f"{p['escalas']} escala" if p["escalas"] == 1 else f"{p['escalas']} escalas"
             linhas.append(
-                f"{emoji} {p['label']} → {p['volta'][8:]} ago | "
-                f"*R$ {p['preco']:.0f}* | {p['cia']} ({p['destino']})"
+                f"{emoji} {p['label']} → {p['label_volta']} | "
+                f"*R$ {p['preco']:.0f}* | {p['cia']} ({p['destino']}) | {esc} | {p['duracao']}"
             )
 
         linhas.append("")
         if melhor["preco"] <= PRECO_ALVO:
             linhas.append(
-                f"🚨 *COMPRA RECOMENDADA!*\n"
-                f"   {melhor['label']} por *R$ {melhor['preco']:.0f}* (2 pessoas)"
+                f"🚨 *COMPRA RECOMENDADA!* {melhor['label']} por *R$ {melhor['preco']:.0f}* (2 pessoas)"
             )
         else:
             diff = melhor["preco"] - PRECO_ALVO
             linhas.append(
-                f"⏳ Melhor: *R$ {melhor['preco']:.0f}* ({melhor['label']})\n"
-                f"   Faltam R$ {diff:.0f} para a meta de R$ {PRECO_ALVO:.0f}"
+                f"⏳ Melhor preço: *R$ {melhor['preco']:.0f}* ({melhor['label']}) "
+                f"— faltam R$ {diff:.0f} para a meta de R$ {PRECO_ALVO:.0f}"
             )
 
     linhas.append("")
@@ -236,7 +240,7 @@ def formatar_mensagem(passagens: list[dict], livelo: dict) -> str:
     linhas.append("🛍️ *PONTUAÇÃO TURBINADA — VAREJO*")
     if livelo["varejo"]:
         for v in livelo["varejo"]:
-            linhas.append(f"⭐ {v['loja']}: *{v['pontos_por_real']}pts/R$*")
+            linhas.append(f"⭐ {v['loja']}: *{v['pontos_por_real']}pts/R$* — válido hoje")
     else:
         linhas.append(f"📊 Sem ofertas acima de {LIMIAR_BONUS_VAREJO}pts/R$ hoje.")
 
