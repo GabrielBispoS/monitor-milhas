@@ -1,11 +1,11 @@
-name: Monitor de Milhas — Diário
+name: Monitor de Milhas — Diário 08h00
 
 on:
   schedule:
-    # 08h10 BRT = 11h10 UTC
-    - cron: "10 11 * * *"
+    # 08h00 BRT = 11h00 UTC
+    - cron: "0 11 * * *"
 
-  # Permite rodar manualmente pelo GitHub (útil para testar)
+  # Permite disparar manualmente pelo GitHub para testar
   workflow_dispatch:
 
 jobs:
@@ -26,10 +26,9 @@ jobs:
 
       - name: Executar monitor
         env:
-          AMADEUS_CLIENT_ID:     ${{ secrets.AMADEUS_CLIENT_ID }}
-          AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
-          EVOLUTION_API_URL:     ${{ secrets.EVOLUTION_API_URL }}
-          EVOLUTION_API_KEY:     ${{ secrets.EVOLUTION_API_KEY }}
-          EVOLUTION_INSTANCE:    ${{ secrets.EVOLUTION_INSTANCE }}
-          WHATSAPP_NUMBER:       ${{ secrets.WHATSAPP_NUMBER }}
+          SERPAPI_KEY:        ${{ secrets.SERPAPI_KEY }}
+          EVOLUTION_API_URL:  ${{ secrets.EVOLUTION_API_URL }}
+          EVOLUTION_API_KEY:  ${{ secrets.EVOLUTION_API_KEY }}
+          EVOLUTION_INSTANCE: ${{ secrets.EVOLUTION_INSTANCE }}
+          WHATSAPP_NUMBER:    ${{ secrets.WHATSAPP_NUMBER }}
         run: python src/monitor.py
