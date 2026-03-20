@@ -1,0 +1,35 @@
+name: Monitor de Milhas — Diário
+
+on:
+  schedule:
+    # 08h10 BRT = 11h10 UTC
+    - cron: "10 11 * * *"
+
+  # Permite rodar manualmente pelo GitHub (útil para testar)
+  workflow_dispatch:
+
+jobs:
+  monitorar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Executar monitor
+        env:
+          AMADEUS_CLIENT_ID:     ${{ secrets.AMADEUS_CLIENT_ID }}
+          AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
+          EVOLUTION_API_URL:     ${{ secrets.EVOLUTION_API_URL }}
+          EVOLUTION_API_KEY:     ${{ secrets.EVOLUTION_API_KEY }}
+          EVOLUTION_INSTANCE:    ${{ secrets.EVOLUTION_INSTANCE }}
+          WHATSAPP_NUMBER:       ${{ secrets.WHATSAPP_NUMBER }}
+        run: python src/monitor.py
