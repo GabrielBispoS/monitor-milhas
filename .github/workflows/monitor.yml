@@ -8,7 +8,7 @@ on:
 
 jobs:
   monitorar:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04   # Ubuntu 22.04 — compatível com libasound2
 
     steps:
       - name: Checkout do repositório
