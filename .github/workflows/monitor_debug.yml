@@ -1,0 +1,39 @@
+name: Monitor DEBUG — inspecionar HTML
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5.4.0
+        with:
+          python-version: "3.12"
+
+      - name: Instalar deps
+        run: pip install playwright requests
+
+      - name: Instalar Chromium
+        run: python -m playwright install chromium --with-deps
+
+      - name: Rodar debug
+        env:
+          EVOLUTION_API_URL:  ${{ secrets.EVOLUTION_API_URL }}
+          EVOLUTION_API_KEY:  ${{ secrets.EVOLUTION_API_KEY }}
+          EVOLUTION_INSTANCE: ${{ secrets.EVOLUTION_INSTANCE }}
+          WHATSAPP_NUMBER:    ${{ secrets.WHATSAPP_NUMBER }}
+        run: python src/monitor_debug.py
+
+      - name: Upload HTMLs e screenshots
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: debug-pages
+          path: /tmp/debug/
+          retention-days: 3
