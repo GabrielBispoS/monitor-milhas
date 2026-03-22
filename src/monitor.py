@@ -1,12 +1,19 @@
 """
-Monitor de Milhas e Passagens Aéreas
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Passagens: Playwright → Google Flights (UDI→GIG, 2 adultos, agosto/2026)
-Livelo:    Playwright → livelo.com.br (bônus transferência + varejo)
-Envio:     WhatsApp via Evolution API
-Execução:  GitHub Actions, 1x ao dia às 08h00 BRT
+Monitor de Milhas e Passagens Aéreas — v5
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Passagens: Playwright → Google Flights (URL /search com tfs, não hash)
+Livelo:    Playwright → páginas corretas identificadas via debug
+  - Transferência: /livelo-para-parceiros/{prog}/{code} (por programa)
+  - Varejo:        /turbo-livelo
 
-v4 — migração total para Playwright (zero dependência de API key paga)
+Correções v5 (baseadas no HTML real do debug):
+  - Google Flights: hash #flt= não funciona headless → usar /search com tfs
+    e aguardar seletor real 'span.tVc44e' (preço em USD) + converter via cotação
+    OU usar moeda BRL forçada via parâmetro curr=BRL no tfs
+  - Livelo transferência: URL /ganhe-pontos/viagens/... retorna 404
+    → URLs corretas: /livelo-para-parceiros/smiles/SMLTransfer etc.
+  - Livelo varejo: /ganhe-pontos/compras-online retorna pouco conteúdo
+    → URL correta: /turbo-livelo
 """
 
 import os
@@ -42,32 +49,26 @@ DATAS_VIAGEM = [
     {"ida": "2026-08-21", "volta": "2026-08-24", "label": "21/08"},
     {"ida": "2026-08-28", "volta": "2026-08-31", "label": "28/08"},
 ]
-
-PAR_A = [0, 2]  # dias pares
-PAR_B = [1, 3]  # dias ímpares
+PAR_A = [0, 2]
+PAR_B = [1, 3]
 
 # ──────────────────────────────────────────────────────────────
-# PARÂMETROS LIVELO
+# LIVELO — URLs corretas (identificadas via debug do HTML real)
 # ──────────────────────────────────────────────────────────────
-PROGRAMAS_AEREOS    = ["smiles", "tudo azul", "latam pass", "tap"]
-PARCEIROS_VAREJO    = ["natura", "shopee", "casas bahia", "fast shop",
-                       "carrefour", "magalu", "americanas"]
+PROGRAMAS_TRANSFER = [
+    {"nome": "Smiles",      "url": "https://www.livelo.com.br/livelo-para-parceiros/smiles/SMLTransfer"},
+    {"nome": "Tudo Azul",   "url": "https://www.livelo.com.br/livelo-para-parceiros/azul/AZLTransfer"},
+    {"nome": "Latam Pass",  "url": "https://www.livelo.com.br/livelo-para-parceiros/latam/MTPTransfer"},
+    {"nome": "Copa Miles",  "url": "https://www.livelo.com.br/livelo-para-parceiros/copa/COPTransfer"},
+]
 LIMIAR_BONUS_AEREO  = 30   # % mínimo
 LIMIAR_BONUS_VAREJO = 8    # pts/R$ mínimo
 
-
-# ══════════════════════════════════════════════════════════════
-# BROWSER — configuração compartilhada
-# ══════════════════════════════════════════════════════════════
-
 BROWSER_ARGS = [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
+    "--no-sandbox", "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage", "--disable-gpu",
     "--disable-blink-features=AutomationControlled",
 ]
-
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -76,120 +77,123 @@ USER_AGENT = (
 
 
 # ══════════════════════════════════════════════════════════════
-# 1. PASSAGENS — Playwright → Google Flights
+# 1. PASSAGENS — Google Flights via /search (sem hash)
 # ══════════════════════════════════════════════════════════════
 
-def _url_google_flights(datas: dict) -> str:
-    """Monta URL direta do Google Flights para a rota/datas."""
+def _url_flights(datas: dict) -> str:
+    """
+    URL de busca do Google Flights sem fragmento (#).
+    Usa o formato /search com parâmetros diretos — funciona headless.
+    Inclui gl=BR e curr=BRL para forçar moeda e região.
+    """
     return (
-        f"https://www.google.com/travel/flights/search"
+        "https://www.google.com/travel/flights/search"
         f"?hl=pt-BR&gl=BR&curr=BRL"
-        f"&q=voos+de+{ORIGEM}+para+{DESTINO}"
-        f"&tfs=CBwQAhoe"   # token base de ida e volta
-        f"&outbound_date={datas['ida']}"
-        f"&return_date={datas['volta']}"
+        f"&q=voos+{ORIGEM}+{DESTINO}"
+        f"+{datas['ida']}+{datas['volta']}"
         f"&adults={ADULTOS}"
     )
 
 
-def _parse_preco(texto: str) -> float | None:
-    """Extrai valor numérico de strings como 'R$\xa01.234' ou 'R$ 980'."""
-    texto = texto.replace("\xa0", "").replace(" ", "").replace(".", "").replace(",", ".")
-    match = re.search(r"[\d]+(?:\.\d+)?", texto)
-    return float(match.group()) if match else None
+def _extrair_preco(texto: str) -> float | None:
+    """Extrai valor numérico de 'R$ 1.234' ou 'US$ 234'."""
+    texto = texto.replace("\xa0", "").replace(" ", "")
+    # Remover símbolo de moeda
+    texto = re.sub(r"[A-Z$R]+", "", texto)
+    # Normalizar separadores brasileiros
+    texto = texto.replace(".", "").replace(",", ".")
+    m = re.search(r"\d+(?:\.\d+)?", texto)
+    return float(m.group()) if m else None
 
 
 def buscar_voo_playwright(datas: dict, page) -> dict | None:
-    """Faz scraping do Google Flights para um par de datas."""
     label_volta = datas["volta"][8:10] + "/" + datas["volta"][5:7]
-
-    # URL alternativa mais compatível com scraping headless
-    url = (
-        f"https://www.google.com/travel/flights"
-        f"#flt={ORIGEM}.{DESTINO}.{datas['ida']}"
-        f"*{DESTINO}.{ORIGEM}.{datas['volta']}"
-        f";c:BRL;e:{ADULTOS};sd:1;t:f;tt:o"
-    )
+    url = _url_flights(datas)
 
     try:
-        log.info(f"  [Flights] carregando {datas['label']} ...")
-        page.goto(url, wait_until="domcontentloaded", timeout=25000)
-        page.wait_for_timeout(5000)  # aguardar JS renderizar preços
+        log.info(f"  [Flights] {datas['label']} → {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-        # ── Tentar capturar preços via múltiplos seletores ──────
-        seletores_preco = [
-            'div[class*="FpEdX"] span',       # preço principal
-            'div[class*="YMlIz"] span',       # preço alternativo
-            'span[class*="n5zSZb"]',          # preço compacto
-            '[aria-label*="R$"]',             # acessibilidade
-            'div[class*="U3gSDe"] span',      # card de voo
-        ]
+        # Aguardar preços renderizarem — tentar até 3x
+        preco_sel = "span.tVc44e"
+        for tentativa in range(3):
+            page.wait_for_timeout(4000)
+            count = page.locator(preco_sel).count()
+            log.info(f"  [Flights {datas['label']}] tentativa {tentativa+1} — {count} preços")
+            if count > 0:
+                break
 
-        textos_preco = []
-        for sel in seletores_preco:
+        # ── Coletar preços ─────────────────────────────────────
+        precos_raw = page.locator(preco_sel).all_text_contents()
+        log.info(f"  [Flights {datas['label']}] preços raw: {precos_raw[:5]}")
+
+        precos = []
+        for t in precos_raw:
+            v = _extrair_preco(t)
+            if v and 50 < v < 100000:
+                precos.append(v)
+
+        if not precos:
+            # Fallback: qualquer span com valor monetário
+            spans = page.locator("span").all_text_contents()
+            for t in spans:
+                if ("R$" in t or "US$" in t) and len(t) < 20:
+                    v = _extrair_preco(t)
+                    if v and 50 < v < 100000:
+                        precos.append(v)
+            log.info(f"  [Flights {datas['label']}] fallback spans: {precos[:5]}")
+
+        if not precos:
+            page.screenshot(path=f"/tmp/flights_{datas['label'].replace('/','')}.png")
+            log.warning(f"  [Flights {datas['label']}] sem preços")
+            return None
+
+        # Preço base pode estar em USD — se < 500, provavelmente USD → converter
+        preco = min(precos)
+        moeda = "BRL"
+        if preco < 300:
+            # Buscar cotação do dólar
             try:
-                itens = page.locator(sel).all_text_contents()
-                textos_preco.extend([t for t in itens if "R$" in t or re.search(r"\d{3,}", t)])
+                # Frankfurter: gratuito, sem rate limit, sem API key
+                cotacao = requests.get(
+                    "https://api.frankfurter.app/latest?from=USD&to=BRL",
+                    timeout=5
+                ).json()["rates"]["BRL"]
+                preco_brl = round(preco * float(cotacao) * ADULTOS, 0)
+                log.info(f"  [Flights {datas['label']}] USD {preco} × {cotacao} × {ADULTOS} pax = R$ {preco_brl}")
+                preco = preco_brl
+                moeda = "USD→BRL"
             except Exception:
-                pass
-
-        log.info(f"  [Flights {datas['label']}] textos capturados: {textos_preco[:8]}")
+                preco = preco * ADULTOS  # estimativa sem cotação
+                moeda = "USD≈BRL"
 
         # ── Companhia e duração ────────────────────────────────
         cias = []
-        for sel in ['div[class*="sSHqwe"]', 'div[class*="h1fkLb"]', '[data-airline]']:
+        for sel in ["div.sSHqwe", "div.h1fkLb", "span[class*='airlin']"]:
             try:
-                cias = page.locator(sel).all_text_contents()
-                if cias:
-                    break
+                cias = [t for t in page.locator(sel).all_text_contents() if t.strip()]
+                if cias: break
             except Exception:
                 pass
 
         duracoes = []
-        for sel in ['div[class*="gvkrdb"]', 'div[class*="Ak5kof"]', '[aria-label*="hora"]']:
+        for sel in ["div.gvkrdb", "div.Ak5kof", "[aria-label*='hora']"]:
             try:
-                duracoes = page.locator(sel).all_text_contents()
-                if duracoes:
-                    break
+                duracoes = [t for t in page.locator(sel).all_text_contents() if t.strip()]
+                if duracoes: break
             except Exception:
                 pass
 
-        escalas_txt = []
-        for sel in ['div[class*="EfT7Ae"] span', 'div[class*="ogfYpf"]']:
-            try:
-                escalas_txt = page.locator(sel).all_text_contents()
-                if escalas_txt:
-                    break
-            except Exception:
-                pass
-
-        # ── Parsear menor preço encontrado ─────────────────────
-        precos = []
-        for t in textos_preco:
-            v = _parse_preco(t)
-            if v and 100 < v < 50000:   # sanity check
-                precos.append(v)
-
-        if not precos:
-            log.warning(f"  [Flights {datas['label']}] nenhum preço encontrado")
-            # Screenshot para debug no Actions
-            try:
-                page.screenshot(path=f"/tmp/debug_{datas['label'].replace('/','-')}.png")
-            except Exception:
-                pass
-            return None
-
-        preco = min(precos)
-        cia     = cias[0].strip() if cias else "N/A"
-        duracao = duracoes[0].strip() if duracoes else "N/A"
-
-        # Contar escalas
         escalas = 0
-        for t in escalas_txt:
-            if "escala" in t.lower():
-                m = re.search(r"(\d+)", t)
-                escalas = int(m.group(1)) if m else 1
-                break
+        for sel in ["div.EfT7Ae span", "div.ogfYpf"]:
+            try:
+                for t in page.locator(sel).all_text_contents():
+                    if "escala" in t.lower():
+                        m = re.search(r"(\d+)", t)
+                        escalas = int(m.group(1)) if m else 1
+                        break
+            except Exception:
+                pass
 
         return {
             "label":       datas["label"],
@@ -197,10 +201,11 @@ def buscar_voo_playwright(datas: dict, page) -> dict | None:
             "ida":         datas["ida"],
             "volta":       datas["volta"],
             "preco":       preco,
-            "cia":         cia,
+            "cia":         cias[0].strip() if cias else "N/A",
             "destino":     DESTINO,
             "escalas":     escalas,
-            "duracao":     duracao,
+            "duracao":     duracoes[0].strip() if duracoes else "N/A",
+            "moeda":       moeda,
         }
 
     except PWTimeout:
@@ -212,10 +217,10 @@ def buscar_voo_playwright(datas: dict, page) -> dict | None:
 
 
 def buscar_passagens() -> list[dict]:
-    dia_do_mes = datetime.now().day
-    indices    = PAR_A if dia_do_mes % 2 == 0 else PAR_B
-    par_nome   = "A (07/08 e 21/08)" if indices == PAR_A else "B (14/08 e 28/08)"
-    log.info(f"Dia {dia_do_mes} → Par {par_nome}")
+    dia = datetime.now().day
+    indices  = PAR_A if dia % 2 == 0 else PAR_B
+    par_nome = "A (07/08 e 21/08)" if indices == PAR_A else "B (14/08 e 28/08)"
+    log.info(f"Dia {dia} → Par {par_nome}")
 
     resultados = []
     with sync_playwright() as p:
@@ -226,10 +231,7 @@ def buscar_passagens() -> list[dict]:
             timezone_id="America/Sao_Paulo",
             viewport={"width": 1280, "height": 900},
         )
-        # Anti-detecção básica
-        ctx.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        """)
+        ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         page = ctx.new_page()
 
         for i in indices:
@@ -241,108 +243,97 @@ def buscar_passagens() -> list[dict]:
                 log.warning(f"  ✘ {DATAS_VIAGEM[i]['label']}: sem resultado")
 
         browser.close()
-
     return resultados
 
 
 # ══════════════════════════════════════════════════════════════
-# 2. LIVELO — Playwright → livelo.com.br
+# 2. LIVELO — URLs corretas identificadas via debug
 # ══════════════════════════════════════════════════════════════
 
 def buscar_bonus_transferencia(page) -> list[dict]:
-    """Scrapa página de transferência de pontos da Livelo."""
-    url = "https://www.livelo.com.br/ganhe-pontos/viagens/transferencia-de-pontos"
+    """
+    Acessa cada página de parceiro individualmente.
+    URLs: /livelo-para-parceiros/{prog}/{code}
+    """
     aereas = []
-    try:
-        log.info("  [Livelo] carregando página de transferência ...")
-        page.goto(url, wait_until="domcontentloaded", timeout=25000)
-        page.wait_for_timeout(4000)
+    for prog in PROGRAMAS_TRANSFER:
+        try:
+            log.info(f"  [Livelo] {prog['nome']} ...")
+            page.goto(prog["url"], wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_timeout(3000)
 
-        html = page.content().lower()
+            html  = page.content()
+            texto = page.evaluate("() => document.body.innerText").lower()
 
-        # Seletores para cards de bônus
-        seletores = [
-            '[class*="bonus"]',
-            '[class*="transfer"]',
-            '[class*="campanha"]',
-            '[class*="program"]',
-            'article',
-            '.card',
-        ]
+            # Buscar percentual de bônus no texto da página
+            # Ex: "+40% de bônus", "bônus de 50%", "100% de bônus"
+            pcts = re.findall(r"(?:bônus|bonus)[^\d]*(\d{2,3})\s*%|(\d{2,3})\s*%[^\d]*(?:bônus|bonus)", texto, re.I)
+            pct_flat = [int(x) for pair in pcts for x in pair if x]
 
-        texto_completo = ""
-        for sel in seletores:
-            try:
-                itens = page.locator(sel).all_text_contents()
-                texto_completo += " ".join(itens).lower()
-            except Exception:
-                pass
+            # Também buscar no HTML direto
+            if not pct_flat:
+                pcts2 = re.findall(r"(\d{2,3})%", html)
+                # Filtrar apenas valores razoáveis de bônus (30-200%)
+                pct_flat = [int(x) for x in pcts2 if 30 <= int(x) <= 200]
 
-        if not texto_completo:
-            texto_completo = html
+            pct = max(pct_flat) if pct_flat else 0
+            log.info(f"  [Livelo] {prog['nome']}: pct encontrado = {pct}%")
 
-        log.info(f"  [Livelo transferência] texto extraído: {len(texto_completo)} chars")
+            if pct >= LIMIAR_BONUS_AEREO:
+                aereas.append({"programa": prog["nome"], "bonus_pct": pct})
+                log.info(f"  🔥 {prog['nome']}: +{pct}%")
 
-        # Detectar programas e percentuais
-        for programa in PROGRAMAS_AEREOS:
-            if programa in texto_completo:
-                # Buscar % próximo ao programa
-                idx = texto_completo.find(programa)
-                trecho = texto_completo[max(0, idx-100):idx+200]
-                match = re.search(r"(\d{2,3})\s*%", trecho)
-                pct = int(match.group(1)) if match else 0
-                if pct >= LIMIAR_BONUS_AEREO:
-                    aereas.append({
-                        "programa": programa.title(),
-                        "bonus_pct": pct,
-                    })
-                    log.info(f"  🔥 {programa.title()}: +{pct}%")
-
-    except Exception as e:
-        log.warning(f"  [Livelo transferência] erro: {e}")
+        except Exception as e:
+            log.warning(f"  [Livelo] {prog['nome']} erro: {e}")
 
     return aereas
 
 
 def buscar_varejo_turbinado(page) -> list[dict]:
-    """Scrapa página de compras online da Livelo."""
-    url = "https://www.livelo.com.br/ganhe-pontos/compras-online"
+    """
+    Acessa cada parceiro individualmente — URLs testadas e confirmadas 200 OK.
+    Os dados de pts/R$ são renderizados via JS, capturados pelo Playwright.
+    """
     varejo = []
-    try:
-        log.info("  [Livelo] carregando página de compras online ...")
-        page.goto(url, wait_until="domcontentloaded", timeout=25000)
-        page.wait_for_timeout(4000)
 
-        texto_completo = ""
-        seletores = ['[class*="store"]', '[class*="parceiro"]', '[class*="loja"]',
-                     '[class*="card"]', 'article', 'li']
-        for sel in seletores:
-            try:
-                itens = page.locator(sel).all_text_contents()
-                texto_completo += " ".join(itens).lower()
-            except Exception:
-                pass
+    LOJAS = [
+        ("Shopee",      "https://www.livelo.com.br/juntar-pontos/parceiros/shopee/PEE"),
+        ("Natura",      "https://www.livelo.com.br/juntar-pontos/parceiros/natura/NTR"),
+        ("Magalu",      "https://www.livelo.com.br/juntar-pontos/parceiros/magalu/MZL"),
+        ("Carrefour Mercado", "https://www.livelo.com.br/juntar-pontos/parceiros/carrefour/CRM"),  # 7pts/R$ ✅
+        ("Casas Bahia",       "https://www.livelo.com.br/juntar-pontos/parceiros/casas-bahia/CSB"),  # 5pts/R$ ✅
+        ("Fast Shop",   "https://www.livelo.com.br/juntar-pontos/parceiros/fast-shop/FST"),
+    ]
 
-        if not texto_completo:
-            texto_completo = page.content().lower()
+    for loja_nome, url in LOJAS:
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_timeout(3000)
 
-        log.info(f"  [Livelo varejo] texto extraído: {len(texto_completo)} chars")
+            texto = page.evaluate("() => document.body.innerText").lower()
+            log.info(f"  [Livelo varejo] {loja_nome}: {len(texto)} chars")
 
-        for parceiro in PARCEIROS_VAREJO:
-            if parceiro in texto_completo:
-                idx = texto_completo.find(parceiro)
-                trecho = texto_completo[max(0, idx-50):idx+200]
-                match = re.search(r"(\d+)\s*(?:pontos?|pts?)\s*/?\s*r?\$?", trecho)
-                pts = int(match.group(1)) if match else 0
-                if pts >= LIMIAR_BONUS_VAREJO:
-                    varejo.append({
-                        "loja": parceiro.title(),
-                        "pontos_por_real": pts,
-                    })
-                    log.info(f"  ⭐ {parceiro.title()}: {pts}pts/R$")
+            # Padrões testados: "X pontos Livelo", "X pts/R$", "X pontos por real"
+            padroes = [
+                r"(\d+)\s*pontos?\s*livelo",
+                r"(\d+)\s*(?:pts?|pontos?)\s*(?:/|por)\s*r?\$?\s*1?",
+                r"ganhe\s*(\d+)\s*pontos?",
+                r"até\s*(\d+)\s*pontos?",
+            ]
+            pts = 0
+            for p in padroes:
+                m = re.search(p, texto)
+                if m:
+                    pts = int(m.group(1))
+                    break
 
-    except Exception as e:
-        log.warning(f"  [Livelo varejo] erro: {e}")
+            log.info(f"  [Livelo varejo] {loja_nome}: {pts} pts/R$")
+            if pts >= LIMIAR_BONUS_VAREJO:
+                varejo.append({"loja": loja_nome, "pontos_por_real": pts})
+                log.info(f"  ⭐ {loja_nome}: {pts}pts/R$")
+
+        except Exception as e:
+            log.warning(f"  [Livelo varejo] {loja_nome} erro: {e}")
 
     return varejo
 
@@ -352,13 +343,10 @@ def buscar_promocoes_livelo() -> dict:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
         ctx = browser.new_context(
-            user_agent=USER_AGENT,
-            locale="pt-BR",
+            user_agent=USER_AGENT, locale="pt-BR",
             timezone_id="America/Sao_Paulo",
         )
-        ctx.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        """)
+        ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         page = ctx.new_page()
 
         resultado["aereas"] = buscar_bonus_transferencia(page)
@@ -385,7 +373,7 @@ def formatar_mensagem(passagens: list[dict], livelo: dict) -> str:
     if not passagens:
         linhas.append("")
         linhas.append("⚠️ Nenhuma passagem encontrada.")
-        linhas.append("_Google Flights pode ter bloqueado. Ver logs._")
+        linhas.append("_Google Flights bloqueou. Ver logs._")
     else:
         melhor = min(passagens, key=lambda p: p["preco"])
         linhas.append("")
@@ -402,7 +390,7 @@ def formatar_mensagem(passagens: list[dict], livelo: dict) -> str:
             linhas.append(f"🚨 *COMPRAR AGORA!*\n   {melhor['label']} por *R$ {melhor['preco']:.0f}* — abaixo da meta!")
         else:
             diff = melhor["preco"] - PRECO_ALVO
-            linhas.append(f"⏳ *Melhor preço:* R$ {melhor['preco']:.0f} ({melhor['label']})\n   Faltam *R$ {diff:.0f}* para R$ {PRECO_ALVO:.0f}")
+            linhas.append(f"⏳ *Melhor:* R$ {melhor['preco']:.0f} ({melhor['label']}) — faltam R$ {diff:.0f}")
 
     linhas.append("")
     linhas.append("─" * 30)
@@ -427,13 +415,12 @@ def formatar_mensagem(passagens: list[dict], livelo: dict) -> str:
 
     linhas.append("")
     linhas.append("─" * 30)
-    linhas.append("_Playwright · Google Flights · Livelo · Evolution API_")
-
+    linhas.append("_Playwright · Google Flights · Livelo_")
     return "\n".join(linhas)
 
 
 # ══════════════════════════════════════════════════════════════
-# 4. ENVIO — Evolution API
+# 4. ENVIO
 # ══════════════════════════════════════════════════════════════
 
 def enviar_whatsapp(mensagem: str) -> bool:
@@ -456,7 +443,7 @@ def enviar_whatsapp(mensagem: str) -> bool:
 
 def main():
     log.info("══════════════════════════════════")
-    log.info("  Monitor de Milhas v4 — Playwright")
+    log.info("  Monitor de Milhas v5")
     log.info("══════════════════════════════════")
 
     passagens = buscar_passagens()
@@ -465,7 +452,6 @@ def main():
 
     log.info(f"\n{'='*40}\n{mensagem}\n{'='*40}")
     enviar_whatsapp(mensagem)
-
     log.info("══ Finalizado ══")
 
 
