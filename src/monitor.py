@@ -1,24 +1,22 @@
 """
-Monitor de Milhas e Passagens Aéreas — v5
+Monitor de Milhas e Passagens Aéreas — v6
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Passagens: Playwright → Google Flights (URL /search com tfs, não hash)
-Livelo:    Playwright → páginas corretas identificadas via debug
-  - Transferência: /livelo-para-parceiros/{prog}/{code} (por programa)
-  - Varejo:        /turbo-livelo
+Passagens: Amadeus Flight Offers Search API (GDS oficial, dados reais)
+Livelo:    Playwright → livelo.com.br (bônus transferência + varejo)
+Envio:     WhatsApp via Evolution API
+Execução:  GitHub Actions, 1x ao dia às 08h00 BRT
 
-Correções v5 (baseadas no HTML real do debug):
-  - Google Flights: hash #flt= não funciona headless → usar /search com tfs
-    e aguardar seletor real 'span.tVc44e' (preço em USD) + converter via cotação
-    OU usar moeda BRL forçada via parâmetro curr=BRL no tfs
-  - Livelo transferência: URL /ganhe-pontos/viagens/... retorna 404
-    → URLs corretas: /livelo-para-parceiros/smiles/SMLTransfer etc.
-  - Livelo varejo: /ganhe-pontos/compras-online retorna pouco conteúdo
-    → URL correta: /turbo-livelo
+Secrets necessários no GitHub:
+  AMADEUS_CLIENT_ID      → API Key do app em developers.amadeus.com
+  AMADEUS_CLIENT_SECRET  → API Secret do app em developers.amadeus.com
+  EVOLUTION_API_URL      → http://137.131.236.152:8080
+  EVOLUTION_API_KEY      → monitor-milhas-key
+  EVOLUTION_INSTANCE     → monitor-milhas
+  WHATSAPP_NUMBER        → 55349XXXXXXXX
 """
 
 import os
 import re
-import json
 import logging
 from datetime import datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -30,10 +28,12 @@ log = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────
 # SECRETS
 # ──────────────────────────────────────────────────────────────
-EVOLUTION_API_URL  = os.environ["EVOLUTION_API_URL"]
-EVOLUTION_API_KEY  = os.environ["EVOLUTION_API_KEY"]
-EVOLUTION_INSTANCE = os.environ["EVOLUTION_INSTANCE"]
-WHATSAPP_NUMBER    = os.environ["WHATSAPP_NUMBER"]
+AMADEUS_CLIENT_ID     = os.environ["AMADEUS_CLIENT_ID"]
+AMADEUS_CLIENT_SECRET = os.environ["AMADEUS_CLIENT_SECRET"]
+EVOLUTION_API_URL     = os.environ["EVOLUTION_API_URL"]
+EVOLUTION_API_KEY     = os.environ["EVOLUTION_API_KEY"]
+EVOLUTION_INSTANCE    = os.environ["EVOLUTION_INSTANCE"]
+WHATSAPP_NUMBER       = os.environ["WHATSAPP_NUMBER"]
 
 # ──────────────────────────────────────────────────────────────
 # PARÂMETROS DE VIAGEM
@@ -49,20 +49,28 @@ DATAS_VIAGEM = [
     {"ida": "2026-08-21", "volta": "2026-08-24", "label": "21/08"},
     {"ida": "2026-08-28", "volta": "2026-08-31", "label": "28/08"},
 ]
-PAR_A = [0, 2]
-PAR_B = [1, 3]
+PAR_A = [0, 2]  # dias pares
+PAR_B = [1, 3]  # dias ímpares
 
 # ──────────────────────────────────────────────────────────────
-# LIVELO — URLs corretas (identificadas via debug do HTML real)
+# LIVELO
 # ──────────────────────────────────────────────────────────────
 PROGRAMAS_TRANSFER = [
-    {"nome": "Smiles",      "url": "https://www.livelo.com.br/livelo-para-parceiros/smiles/SMLTransfer"},
-    {"nome": "Tudo Azul",   "url": "https://www.livelo.com.br/livelo-para-parceiros/azul/AZLTransfer"},
-    {"nome": "Latam Pass",  "url": "https://www.livelo.com.br/livelo-para-parceiros/latam/MTPTransfer"},
-    {"nome": "Copa Miles",  "url": "https://www.livelo.com.br/livelo-para-parceiros/copa/COPTransfer"},
+    {"nome": "Smiles",     "url": "https://www.livelo.com.br/livelo-para-parceiros/smiles/SMLTransfer"},
+    {"nome": "Tudo Azul",  "url": "https://www.livelo.com.br/livelo-para-parceiros/azul/AZLTransfer"},
+    {"nome": "Latam Pass", "url": "https://www.livelo.com.br/livelo-para-parceiros/latam/MTPTransfer"},
+    {"nome": "Copa Miles", "url": "https://www.livelo.com.br/livelo-para-parceiros/copa/COPTransfer"},
 ]
-LIMIAR_BONUS_AEREO  = 30   # % mínimo
-LIMIAR_BONUS_VAREJO = 8    # pts/R$ mínimo
+LOJAS_VAREJO = [
+    ("Shopee",           "https://www.livelo.com.br/juntar-pontos/parceiros/shopee/PEE"),
+    ("Natura",           "https://www.livelo.com.br/juntar-pontos/parceiros/natura/NTR"),
+    ("Magalu",           "https://www.livelo.com.br/juntar-pontos/parceiros/magalu/MZL"),
+    ("Carrefour Mercado","https://www.livelo.com.br/juntar-pontos/parceiros/carrefour/CRM"),
+    ("Casas Bahia",      "https://www.livelo.com.br/juntar-pontos/parceiros/casas-bahia/CSB"),
+    ("Fast Shop",        "https://www.livelo.com.br/juntar-pontos/parceiros/fast-shop/FST"),
+]
+LIMIAR_BONUS_AEREO  = 30
+LIMIAR_BONUS_VAREJO = 5   # baixado de 8 para capturar Carrefour(7) e Casas Bahia(5)
 
 BROWSER_ARGS = [
     "--no-sandbox", "--disable-setuid-sandbox",
@@ -77,123 +85,95 @@ USER_AGENT = (
 
 
 # ══════════════════════════════════════════════════════════════
-# 1. PASSAGENS — Google Flights via /search (sem hash)
+# 1. PASSAGENS — Amadeus Flight Offers Search API
 # ══════════════════════════════════════════════════════════════
 
-def _url_flights(datas: dict) -> str:
+def amadeus_get_token() -> str | None:
     """
-    URL de busca do Google Flights sem fragmento (#).
-    Usa o formato /search com parâmetros diretos — funciona headless.
-    Inclui gl=BR e curr=BRL para forçar moeda e região.
+    Obtém access token OAuth2 da Amadeus.
+    Token dura 30 minutos — suficiente para o script inteiro.
     """
-    return (
-        "https://www.google.com/travel/flights/search"
-        f"?hl=pt-BR&gl=BR&curr=BRL"
-        f"&q=voos+{ORIGEM}+{DESTINO}"
-        f"+{datas['ida']}+{datas['volta']}"
-        f"&adults={ADULTOS}"
-    )
+    try:
+        r = requests.post(
+            "https://test.api.amadeus.com/v1/security/oauth2/token",
+            data={
+                "grant_type":    "client_credentials",
+                "client_id":     AMADEUS_CLIENT_ID,
+                "client_secret": AMADEUS_CLIENT_SECRET,
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        token = r.json()["access_token"]
+        log.info("  [Amadeus] token obtido ✅")
+        return token
+    except Exception as e:
+        log.error(f"  [Amadeus] erro ao obter token: {e}")
+        return None
 
 
-def _extrair_preco(texto: str) -> float | None:
-    """Extrai valor numérico de 'R$ 1.234' ou 'US$ 234'."""
-    texto = texto.replace("\xa0", "").replace(" ", "")
-    # Remover símbolo de moeda
-    texto = re.sub(r"[A-Z$R]+", "", texto)
-    # Normalizar separadores brasileiros
-    texto = texto.replace(".", "").replace(",", ".")
-    m = re.search(r"\d+(?:\.\d+)?", texto)
-    return float(m.group()) if m else None
-
-
-def buscar_voo_playwright(datas: dict, page) -> dict | None:
+def buscar_voo_amadeus(datas: dict, token: str) -> dict | None:
+    """
+    Busca o voo mais barato UDI→GIG para um par de datas via Amadeus.
+    Endpoint: GET /v2/shopping/flight-offers
+    Retorna preço real em BRL, cia aérea, escalas e duração.
+    """
     label_volta = datas["volta"][8:10] + "/" + datas["volta"][5:7]
-    url = _url_flights(datas)
 
     try:
-        log.info(f"  [Flights] {datas['label']} → {url}")
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        log.info(f"  [Amadeus] buscando {datas['label']} ...")
+        r = requests.get(
+            "https://test.api.amadeus.com/v2/shopping/flight-offers",
+            params={
+                "originLocationCode":      ORIGEM,
+                "destinationLocationCode": DESTINO,
+                "departureDate":           datas["ida"],
+                "returnDate":              datas["volta"],
+                "adults":                  ADULTOS,
+                "currencyCode":            "BRL",
+                "max":                     10,  # top 10 para pegar o mais barato
+                "nonStop":                 "false",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=20,
+        )
 
-        # Aguardar preços renderizarem — tentar até 3x
-        preco_sel = "span.tVc44e"
-        for tentativa in range(3):
-            page.wait_for_timeout(4000)
-            count = page.locator(preco_sel).count()
-            log.info(f"  [Flights {datas['label']}] tentativa {tentativa+1} — {count} preços")
-            if count > 0:
-                break
-
-        # ── Coletar preços ─────────────────────────────────────
-        precos_raw = page.locator(preco_sel).all_text_contents()
-        log.info(f"  [Flights {datas['label']}] preços raw: {precos_raw[:5]}")
-
-        precos = []
-        for t in precos_raw:
-            v = _extrair_preco(t)
-            if v and 50 < v < 100000:
-                precos.append(v)
-
-        if not precos:
-            # Fallback: qualquer span com valor monetário
-            spans = page.locator("span").all_text_contents()
-            for t in spans:
-                if ("R$" in t or "US$" in t) and len(t) < 20:
-                    v = _extrair_preco(t)
-                    if v and 50 < v < 100000:
-                        precos.append(v)
-            log.info(f"  [Flights {datas['label']}] fallback spans: {precos[:5]}")
-
-        if not precos:
-            page.screenshot(path=f"/tmp/flights_{datas['label'].replace('/','')}.png")
-            log.warning(f"  [Flights {datas['label']}] sem preços")
+        if r.status_code == 400:
+            log.warning(f"  [Amadeus {datas['label']}] 400 — rota sem dados no sandbox: {r.text[:150]}")
             return None
 
-        # Preço base pode estar em USD — se < 500, provavelmente USD → converter
-        preco = min(precos)
-        moeda = "BRL"
-        if preco < 300:
-            # Buscar cotação do dólar
-            try:
-                # Frankfurter: gratuito, sem rate limit, sem API key
-                cotacao = requests.get(
-                    "https://api.frankfurter.app/latest?from=USD&to=BRL",
-                    timeout=5
-                ).json()["rates"]["BRL"]
-                preco_brl = round(preco * float(cotacao) * ADULTOS, 0)
-                log.info(f"  [Flights {datas['label']}] USD {preco} × {cotacao} × {ADULTOS} pax = R$ {preco_brl}")
-                preco = preco_brl
-                moeda = "USD→BRL"
-            except Exception:
-                preco = preco * ADULTOS  # estimativa sem cotação
-                moeda = "USD≈BRL"
+        r.raise_for_status()
+        data = r.json()
 
-        # ── Companhia e duração ────────────────────────────────
-        cias = []
-        for sel in ["div.sSHqwe", "div.h1fkLb", "span[class*='airlin']"]:
-            try:
-                cias = [t for t in page.locator(sel).all_text_contents() if t.strip()]
-                if cias: break
-            except Exception:
-                pass
+        ofertas = data.get("data", [])
+        log.info(f"  [Amadeus {datas['label']}] {len(ofertas)} ofertas retornadas")
 
-        duracoes = []
-        for sel in ["div.gvkrdb", "div.Ak5kof", "[aria-label*='hora']"]:
-            try:
-                duracoes = [t for t in page.locator(sel).all_text_contents() if t.strip()]
-                if duracoes: break
-            except Exception:
-                pass
+        if not ofertas:
+            return None
 
-        escalas = 0
-        for sel in ["div.EfT7Ae span", "div.ogfYpf"]:
-            try:
-                for t in page.locator(sel).all_text_contents():
-                    if "escala" in t.lower():
-                        m = re.search(r"(\d+)", t)
-                        escalas = int(m.group(1)) if m else 1
-                        break
-            except Exception:
-                pass
+        # ── Pegar a oferta mais barata ─────────────────────────
+        melhor = min(ofertas, key=lambda o: float(o["price"]["grandTotal"]))
+        preco  = float(melhor["price"]["grandTotal"])
+
+        # ── Extrair dados do itinerário de ida ─────────────────
+        itinerario_ida   = melhor["itineraries"][0]
+        segments_ida     = itinerario_ida["segments"]
+        primeiro_seg     = segments_ida[0]
+        ultimo_seg       = segments_ida[-1]
+
+        cia              = primeiro_seg["carrierCode"]
+        escalas          = len(segments_ida) - 1
+        duracao_raw      = itinerario_ida["duration"]  # ex: "PT2H30M"
+        duracao          = _formatar_duracao(duracao_raw)
+
+        # Nome da cia via dicionário (cias brasileiras principais)
+        cias_nomes = {
+            "G3": "Gol", "LA": "LATAM", "AD": "Azul",
+            "JJ": "LATAM", "O6": "Decolar", "TP": "TAP",
+        }
+        cia_nome = cias_nomes.get(cia, cia)
+
+        log.info(f"  [Amadeus {datas['label']}] R$ {preco:.0f} | {cia_nome} | {escalas} escala(s) | {duracao}")
 
         return {
             "label":       datas["label"],
@@ -201,60 +181,55 @@ def buscar_voo_playwright(datas: dict, page) -> dict | None:
             "ida":         datas["ida"],
             "volta":       datas["volta"],
             "preco":       preco,
-            "cia":         cias[0].strip() if cias else "N/A",
-            "destino":     DESTINO,
+            "cia":         cia_nome,
+            "destino":     ultimo_seg["arrival"]["iataCode"],
             "escalas":     escalas,
-            "duracao":     duracoes[0].strip() if duracoes else "N/A",
-            "moeda":       moeda,
+            "duracao":     duracao,
         }
 
-    except PWTimeout:
-        log.warning(f"  [Flights {datas['label']}] timeout")
-        return None
     except Exception as e:
-        log.warning(f"  [Flights {datas['label']}] erro: {e}")
+        log.warning(f"  [Amadeus {datas['label']}] erro: {e}")
         return None
+
+
+def _formatar_duracao(iso: str) -> str:
+    """Converte 'PT2H30M' → '2h30'."""
+    m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?", iso)
+    if not m:
+        return iso
+    horas  = int(m.group(1) or 0)
+    minutos = int(m.group(2) or 0)
+    return f"{horas}h{minutos:02d}"
 
 
 def buscar_passagens() -> list[dict]:
-    dia = datetime.now().day
+    dia      = datetime.now().day
     indices  = PAR_A if dia % 2 == 0 else PAR_B
     par_nome = "A (07/08 e 21/08)" if indices == PAR_A else "B (14/08 e 28/08)"
     log.info(f"Dia {dia} → Par {par_nome}")
 
+    token = amadeus_get_token()
+    if not token:
+        log.error("Sem token Amadeus — abortando busca de passagens")
+        return []
+
     resultados = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
-        ctx = browser.new_context(
-            user_agent=USER_AGENT,
-            locale="pt-BR",
-            timezone_id="America/Sao_Paulo",
-            viewport={"width": 1280, "height": 900},
-        )
-        ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
-        page = ctx.new_page()
+    for i in indices:
+        voo = buscar_voo_amadeus(DATAS_VIAGEM[i], token)
+        if voo:
+            resultados.append(voo)
+            log.info(f"  ✔ {voo['label']}: R$ {voo['preco']:.0f} ({voo['cia']})")
+        else:
+            log.warning(f"  ✘ {DATAS_VIAGEM[i]['label']}: sem resultado")
 
-        for i in indices:
-            voo = buscar_voo_playwright(DATAS_VIAGEM[i], page)
-            if voo:
-                resultados.append(voo)
-                log.info(f"  ✔ {voo['label']}: R$ {voo['preco']:.0f} ({voo['cia']})")
-            else:
-                log.warning(f"  ✘ {DATAS_VIAGEM[i]['label']}: sem resultado")
-
-        browser.close()
     return resultados
 
 
 # ══════════════════════════════════════════════════════════════
-# 2. LIVELO — URLs corretas identificadas via debug
+# 2. LIVELO — Playwright (URLs testadas e confirmadas)
 # ══════════════════════════════════════════════════════════════
 
 def buscar_bonus_transferencia(page) -> list[dict]:
-    """
-    Acessa cada página de parceiro individualmente.
-    URLs: /livelo-para-parceiros/{prog}/{code}
-    """
     aereas = []
     for prog in PROGRAMAS_TRANSFER:
         try:
@@ -265,19 +240,21 @@ def buscar_bonus_transferencia(page) -> list[dict]:
             html  = page.content()
             texto = page.evaluate("() => document.body.innerText").lower()
 
-            # Buscar percentual de bônus no texto da página
-            # Ex: "+40% de bônus", "bônus de 50%", "100% de bônus"
-            pcts = re.findall(r"(?:bônus|bonus)[^\d]*(\d{2,3})\s*%|(\d{2,3})\s*%[^\d]*(?:bônus|bonus)", texto, re.I)
+            # Buscar % próximo a "bônus" no texto renderizado pelo JS
+            pcts = re.findall(
+                r"(?:bônus|bonus)[^\d]{0,30}(\d{2,3})\s*%"
+                r"|(\d{2,3})\s*%[^\d]{0,30}(?:bônus|bonus|a mais|extra)",
+                texto, re.I
+            )
             pct_flat = [int(x) for pair in pcts for x in pair if x]
 
-            # Também buscar no HTML direto
+            # Fallback: qualquer % razoável no HTML
             if not pct_flat:
-                pcts2 = re.findall(r"(\d{2,3})%", html)
-                # Filtrar apenas valores razoáveis de bônus (30-200%)
+                pcts2    = re.findall(r"(\d{2,3})%", html)
                 pct_flat = [int(x) for x in pcts2 if 30 <= int(x) <= 200]
 
             pct = max(pct_flat) if pct_flat else 0
-            log.info(f"  [Livelo] {prog['nome']}: pct encontrado = {pct}%")
+            log.info(f"  [Livelo] {prog['nome']}: {pct}%")
 
             if pct >= LIMIAR_BONUS_AEREO:
                 aereas.append({"programa": prog["nome"], "bonus_pct": pct})
@@ -290,22 +267,8 @@ def buscar_bonus_transferencia(page) -> list[dict]:
 
 
 def buscar_varejo_turbinado(page) -> list[dict]:
-    """
-    Acessa cada parceiro individualmente — URLs testadas e confirmadas 200 OK.
-    Os dados de pts/R$ são renderizados via JS, capturados pelo Playwright.
-    """
     varejo = []
-
-    LOJAS = [
-        ("Shopee",      "https://www.livelo.com.br/juntar-pontos/parceiros/shopee/PEE"),
-        ("Natura",      "https://www.livelo.com.br/juntar-pontos/parceiros/natura/NTR"),
-        ("Magalu",      "https://www.livelo.com.br/juntar-pontos/parceiros/magalu/MZL"),
-        ("Carrefour Mercado", "https://www.livelo.com.br/juntar-pontos/parceiros/carrefour/CRM"),  # 7pts/R$ ✅
-        ("Casas Bahia",       "https://www.livelo.com.br/juntar-pontos/parceiros/casas-bahia/CSB"),  # 5pts/R$ ✅
-        ("Fast Shop",   "https://www.livelo.com.br/juntar-pontos/parceiros/fast-shop/FST"),
-    ]
-
-    for loja_nome, url in LOJAS:
+    for loja_nome, url in LOJAS_VAREJO:
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=20000)
             page.wait_for_timeout(3000)
@@ -313,7 +276,6 @@ def buscar_varejo_turbinado(page) -> list[dict]:
             texto = page.evaluate("() => document.body.innerText").lower()
             log.info(f"  [Livelo varejo] {loja_nome}: {len(texto)} chars")
 
-            # Padrões testados: "X pontos Livelo", "X pts/R$", "X pontos por real"
             padroes = [
                 r"(\d+)\s*pontos?\s*livelo",
                 r"(\d+)\s*(?:pts?|pontos?)\s*(?:/|por)\s*r?\$?\s*1?",
@@ -342,8 +304,9 @@ def buscar_promocoes_livelo() -> dict:
     resultado = {"aereas": [], "varejo": []}
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
-        ctx = browser.new_context(
-            user_agent=USER_AGENT, locale="pt-BR",
+        ctx     = browser.new_context(
+            user_agent=USER_AGENT,
+            locale="pt-BR",
             timezone_id="America/Sao_Paulo",
         )
         ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
@@ -373,7 +336,7 @@ def formatar_mensagem(passagens: list[dict], livelo: dict) -> str:
     if not passagens:
         linhas.append("")
         linhas.append("⚠️ Nenhuma passagem encontrada.")
-        linhas.append("_Google Flights bloqueou. Ver logs._")
+        linhas.append("_Verificar AMADEUS\\_CLIENT\\_ID nos Secrets._")
     else:
         melhor = min(passagens, key=lambda p: p["preco"])
         linhas.append("")
@@ -415,12 +378,12 @@ def formatar_mensagem(passagens: list[dict], livelo: dict) -> str:
 
     linhas.append("")
     linhas.append("─" * 30)
-    linhas.append("_Playwright · Google Flights · Livelo_")
+    linhas.append("_Amadeus API · Livelo · Evolution API_")
     return "\n".join(linhas)
 
 
 # ══════════════════════════════════════════════════════════════
-# 4. ENVIO
+# 4. ENVIO — Evolution API
 # ══════════════════════════════════════════════════════════════
 
 def enviar_whatsapp(mensagem: str) -> bool:
@@ -443,7 +406,7 @@ def enviar_whatsapp(mensagem: str) -> bool:
 
 def main():
     log.info("══════════════════════════════════")
-    log.info("  Monitor de Milhas v5")
+    log.info("  Monitor de Milhas v6 — Amadeus")
     log.info("══════════════════════════════════")
 
     passagens = buscar_passagens()

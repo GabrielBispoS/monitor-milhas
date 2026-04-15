@@ -10,15 +10,15 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout do repositório
+      - name: Checkout
         uses: actions/checkout@v4.2.2
 
-      - name: Configurar Python 3.12
+      - name: Python 3.12
         uses: actions/setup-python@v5.4.0
         with:
           python-version: "3.12"
 
-      - name: Instalar dependências Python
+      - name: Instalar dependências
         run: pip install -r requirements.txt
 
       - name: Instalar Chromium (Playwright)
@@ -26,8 +26,10 @@ jobs:
 
       - name: Executar monitor
         env:
-          EVOLUTION_API_URL:  ${{ secrets.EVOLUTION_API_URL }}
-          EVOLUTION_API_KEY:  ${{ secrets.EVOLUTION_API_KEY }}
-          EVOLUTION_INSTANCE: ${{ secrets.EVOLUTION_INSTANCE }}
-          WHATSAPP_NUMBER:    ${{ secrets.WHATSAPP_NUMBER }}
+          AMADEUS_CLIENT_ID:     ${{ secrets.AMADEUS_CLIENT_ID }}
+          AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
+          EVOLUTION_API_URL:     ${{ secrets.EVOLUTION_API_URL }}
+          EVOLUTION_API_KEY:     ${{ secrets.EVOLUTION_API_KEY }}
+          EVOLUTION_INSTANCE:    ${{ secrets.EVOLUTION_INSTANCE }}
+          WHATSAPP_NUMBER:       ${{ secrets.WHATSAPP_NUMBER }}
         run: python src/monitor.py
